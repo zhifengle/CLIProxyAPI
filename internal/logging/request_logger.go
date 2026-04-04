@@ -10,6 +10,7 @@ import (
 	"compress/gzip"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -21,6 +22,7 @@ import (
 	"github.com/andybalholm/brotli"
 	"github.com/klauspost/compress/zstd"
 	log "github.com/sirupsen/logrus"
+	"github.com/tidwall/gjson"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/buildinfo"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
@@ -28,6 +30,13 @@ import (
 )
 
 var requestLogID atomic.Uint64
+
+type requestSummary struct {
+	Client         string
+	RequestedModel string
+	UpstreamModel  string
+	UpstreamURL    string
+}
 
 // RequestLogger defines the interface for logging HTTP requests and responses.
 // It provides methods for logging both regular and streaming HTTP request/response cycles.
@@ -551,7 +560,7 @@ func (l *FileRequestLogger) writeNonStreamingLog(
 	isWebsocketTranscript := hasSectionPayload(websocketTimeline)
 	downstreamTransport := inferDownstreamTransport(requestHeaders, websocketTimeline)
 	upstreamTransport := inferUpstreamTransport(apiRequest, apiResponse, apiWebsocketTimeline, apiResponseErrors)
-	if errWrite := writeRequestInfoWithBody(w, url, method, requestHeaders, requestBody, requestBodyPath, requestTimestamp, downstreamTransport, upstreamTransport, !isWebsocketTranscript); errWrite != nil {
+	if errWrite := writeRequestInfoWithBody(w, url, method, requestHeaders, requestBody, requestBodyPath, apiRequest, apiWebsocketTimeline, requestTimestamp, downstreamTransport, upstreamTransport, !isWebsocketTranscript); errWrite != nil {
 		return errWrite
 	}
 	if errWrite := writeAPISection(w, "=== WEBSOCKET TIMELINE ===\n", "=== WEBSOCKET TIMELINE", websocketTimeline, time.Time{}); errWrite != nil {
@@ -584,6 +593,8 @@ func writeRequestInfoWithBody(
 	headers map[string][]string,
 	body []byte,
 	bodyPath string,
+	apiRequest []byte,
+	apiWebsocketTimeline []byte,
 	timestamp time.Time,
 	downstreamTransport string,
 	upstreamTransport string,
@@ -610,6 +621,17 @@ func writeRequestInfoWithBody(
 		if _, errWrite := io.WriteString(w, fmt.Sprintf("Upstream Transport: %s\n", upstreamTransport)); errWrite != nil {
 			return errWrite
 		}
+	}
+	requestBody := body
+	if len(requestBody) == 0 && bodyPath != "" {
+		bodyFromFile, errRead := os.ReadFile(bodyPath)
+		if errRead != nil {
+			return errRead
+		}
+		requestBody = bodyFromFile
+	}
+	if errWrite := writeRequestSummary(w, buildRequestSummary(headers, requestBody, apiRequest, apiWebsocketTimeline)); errWrite != nil {
+		return errWrite
 	}
 	if _, errWrite := io.WriteString(w, fmt.Sprintf("Timestamp: %s\n", timestamp.Format(time.RFC3339Nano))); errWrite != nil {
 		return errWrite
@@ -668,6 +690,196 @@ func writeRequestInfoWithBody(
 		return errWrite
 	}
 	return nil
+}
+
+func writeRequestSummary(w io.Writer, summary requestSummary) error {
+	if strings.TrimSpace(summary.Client) != "" {
+		if _, errWrite := io.WriteString(w, fmt.Sprintf("Client: %s\n", summary.Client)); errWrite != nil {
+			return errWrite
+		}
+	}
+	if strings.TrimSpace(summary.RequestedModel) != "" {
+		if _, errWrite := io.WriteString(w, fmt.Sprintf("Requested Model: %s\n", summary.RequestedModel)); errWrite != nil {
+			return errWrite
+		}
+	}
+	if strings.TrimSpace(summary.UpstreamModel) != "" {
+		if _, errWrite := io.WriteString(w, fmt.Sprintf("Upstream Model: %s\n", summary.UpstreamModel)); errWrite != nil {
+			return errWrite
+		}
+	}
+	if strings.TrimSpace(summary.UpstreamURL) != "" {
+		if _, errWrite := io.WriteString(w, fmt.Sprintf("Upstream URL: %s\n", summary.UpstreamURL)); errWrite != nil {
+			return errWrite
+		}
+	}
+	return nil
+}
+
+func buildRequestSummary(headers map[string][]string, requestBody []byte, apiRequest []byte, apiWebsocketTimeline []byte) requestSummary {
+	summary := requestSummary{
+		Client:         summarizeClient(headers),
+		RequestedModel: extractModelFromJSON(requestBody),
+	}
+
+	summary.UpstreamURL = extractLastLabeledValue(apiRequest, "Upstream URL")
+	if summary.UpstreamURL == "" {
+		summary.UpstreamURL = extractLastLabeledValue(apiWebsocketTimeline, "Upstream URL")
+	}
+
+	upstreamBody := extractLastBodyBlock(apiRequest)
+	if len(upstreamBody) == 0 {
+		upstreamBody = extractLastEventBody(apiWebsocketTimeline, "api.websocket.request")
+	}
+	summary.UpstreamModel = extractModelFromJSON(upstreamBody)
+	if summary.UpstreamModel == "" {
+		summary.UpstreamModel = extractModelFromURL(summary.UpstreamURL)
+	}
+
+	return summary
+}
+
+func summarizeClient(headers map[string][]string) string {
+	var parts []string
+	if ua := firstHeaderValue(headers, "User-Agent"); ua != "" {
+		parts = append(parts, fmt.Sprintf("user-agent=%s", ua))
+	}
+	if pkg := firstHeaderValue(headers, "X-Stainless-Package"); pkg != "" {
+		parts = append(parts, fmt.Sprintf("stainless-package=%s", pkg))
+	}
+	if lang := firstHeaderValue(headers, "X-Stainless-Lang"); lang != "" {
+		parts = append(parts, fmt.Sprintf("stainless-lang=%s", lang))
+	}
+	if version := firstHeaderValue(headers, "Anthropic-Version"); version != "" {
+		parts = append(parts, fmt.Sprintf("anthropic-version=%s", version))
+	}
+	if clientName := firstHeaderValue(headers, "X-Client-Name"); clientName != "" {
+		parts = append(parts, fmt.Sprintf("x-client-name=%s", clientName))
+	}
+	if clientVersion := firstHeaderValue(headers, "X-Client-Version"); clientVersion != "" {
+		parts = append(parts, fmt.Sprintf("x-client-version=%s", clientVersion))
+	}
+	return strings.Join(parts, ", ")
+}
+
+func firstHeaderValue(headers map[string][]string, wantKey string) string {
+	for key, values := range headers {
+		if !strings.EqualFold(strings.TrimSpace(key), wantKey) || len(values) == 0 {
+			continue
+		}
+		trimmed := strings.TrimSpace(values[0])
+		if trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
+func extractModelFromJSON(payload []byte) string {
+	trimmed := bytes.TrimSpace(payload)
+	if len(trimmed) == 0 || !gjson.ValidBytes(trimmed) {
+		return ""
+	}
+	for _, path := range []string{"model", "request.model", "model.name"} {
+		result := gjson.GetBytes(trimmed, path)
+		if result.Type == gjson.String {
+			if value := strings.TrimSpace(result.String()); value != "" {
+				return value
+			}
+		}
+	}
+	return ""
+}
+
+func extractLastLabeledValue(payload []byte, label string) string {
+	trimmed := bytes.TrimSpace(payload)
+	if len(trimmed) == 0 || strings.TrimSpace(label) == "" {
+		return ""
+	}
+	needle := label + ":"
+	lines := strings.Split(string(trimmed), "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := strings.TrimSpace(lines[i])
+		if !strings.HasPrefix(line, needle) {
+			continue
+		}
+		value := strings.TrimSpace(strings.TrimPrefix(line, needle))
+		if value != "" && value != "<unknown>" {
+			return value
+		}
+	}
+	return ""
+}
+
+func extractLastBodyBlock(payload []byte) []byte {
+	return extractBodyBlock(payload, "")
+}
+
+func extractLastEventBody(payload []byte, eventName string) []byte {
+	return extractBodyBlock(payload, eventName)
+}
+
+func extractBodyBlock(payload []byte, eventName string) []byte {
+	trimmed := bytes.TrimSpace(payload)
+	if len(trimmed) == 0 {
+		return nil
+	}
+	text := string(trimmed)
+	if eventName != "" {
+		eventNeedle := "Event: " + eventName
+		eventIdx := strings.LastIndex(text, eventNeedle)
+		if eventIdx == -1 {
+			return nil
+		}
+		text = text[eventIdx:]
+	}
+	bodyIdx := strings.LastIndex(text, "Body:\n")
+	if bodyIdx == -1 {
+		return nil
+	}
+	bodyText := text[bodyIdx+len("Body:\n"):]
+	for _, marker := range []string{"\n\nTimestamp:", "\n\nEvent:", "\n\n=== "} {
+		if idx := strings.Index(bodyText, marker); idx >= 0 {
+			bodyText = bodyText[:idx]
+			break
+		}
+	}
+	bodyText = strings.TrimSpace(bodyText)
+	if bodyText == "" || bodyText == "<empty>" {
+		return nil
+	}
+	return []byte(bodyText)
+}
+
+func extractModelFromURL(rawURL string) string {
+	trimmed := strings.TrimSpace(rawURL)
+	if trimmed == "" {
+		return ""
+	}
+	parsed, errParse := url.Parse(trimmed)
+	if errParse != nil {
+		return ""
+	}
+	if model := strings.TrimSpace(parsed.Query().Get("model")); model != "" {
+		return model
+	}
+	path := parsed.EscapedPath()
+	modelIdx := strings.LastIndex(path, "/models/")
+	if modelIdx == -1 {
+		return ""
+	}
+	model := path[modelIdx+len("/models/"):]
+	if idx := strings.Index(model, ":"); idx >= 0 {
+		model = model[:idx]
+	}
+	if idx := strings.Index(model, "/"); idx >= 0 {
+		model = model[:idx]
+	}
+	model, errUnescape := url.PathUnescape(model)
+	if errUnescape != nil {
+		return strings.TrimSpace(model)
+	}
+	return strings.TrimSpace(model)
 }
 
 func countTrailingNewlinesBytes(payload []byte) int {
@@ -886,7 +1098,7 @@ func (l *FileRequestLogger) formatLogContent(url, method string, headers map[str
 	upstreamTransport := inferUpstreamTransport(apiRequest, apiResponse, apiWebsocketTimeline, apiResponseErrors)
 
 	// Request info
-	content.WriteString(l.formatRequestInfo(url, method, headers, body, downstreamTransport, upstreamTransport, !isWebsocketTranscript))
+	content.WriteString(l.formatRequestInfo(url, method, headers, body, apiRequest, apiWebsocketTimeline, downstreamTransport, upstreamTransport, !isWebsocketTranscript))
 
 	if len(websocketTimeline) > 0 {
 		if bytes.HasPrefix(websocketTimeline, []byte("=== WEBSOCKET TIMELINE")) {
@@ -1117,7 +1329,7 @@ func (l *FileRequestLogger) decompressZstd(data []byte) ([]byte, error) {
 //
 // Returns:
 //   - string: The formatted request information
-func (l *FileRequestLogger) formatRequestInfo(url, method string, headers map[string][]string, body []byte, downstreamTransport string, upstreamTransport string, includeBody bool) string {
+func (l *FileRequestLogger) formatRequestInfo(url, method string, headers map[string][]string, body []byte, apiRequest []byte, apiWebsocketTimeline []byte, downstreamTransport string, upstreamTransport string, includeBody bool) string {
 	var content strings.Builder
 
 	content.WriteString("=== REQUEST INFO ===\n")
@@ -1130,6 +1342,7 @@ func (l *FileRequestLogger) formatRequestInfo(url, method string, headers map[st
 	if strings.TrimSpace(upstreamTransport) != "" {
 		content.WriteString(fmt.Sprintf("Upstream Transport: %s\n", upstreamTransport))
 	}
+	_ = writeRequestSummary(&content, buildRequestSummary(headers, body, apiRequest, apiWebsocketTimeline))
 	content.WriteString(fmt.Sprintf("Timestamp: %s\n", time.Now().Format(time.RFC3339Nano)))
 	content.WriteString("\n")
 
@@ -1394,7 +1607,7 @@ func (w *FileStreamingLogWriter) asyncWriter() {
 }
 
 func (w *FileStreamingLogWriter) writeFinalLog(logFile *os.File) error {
-	if errWrite := writeRequestInfoWithBody(logFile, w.url, w.method, w.requestHeaders, nil, w.requestBodyPath, w.timestamp, "http", inferUpstreamTransport(w.apiRequest, w.apiResponse, w.apiWebsocketTimeline, nil), true); errWrite != nil {
+	if errWrite := writeRequestInfoWithBody(logFile, w.url, w.method, w.requestHeaders, nil, w.requestBodyPath, w.apiRequest, w.apiWebsocketTimeline, w.timestamp, "http", inferUpstreamTransport(w.apiRequest, w.apiResponse, w.apiWebsocketTimeline, nil), true); errWrite != nil {
 		return errWrite
 	}
 	if errWrite := writeAPISection(logFile, "=== API WEBSOCKET TIMELINE ===\n", "=== API WEBSOCKET TIMELINE", w.apiWebsocketTimeline, time.Time{}); errWrite != nil {

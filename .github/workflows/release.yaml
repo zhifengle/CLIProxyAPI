@@ -2,7 +2,6 @@ name: goreleaser
 
 on:
   push:
-    # run only against tags
     tags:
       - '*'
 
@@ -30,7 +29,8 @@ jobs:
           echo "VERSION=${GITHUB_REF_NAME}" >> $GITHUB_ENV
           echo COMMIT=`git rev-parse --short HEAD` >> $GITHUB_ENV
           echo BUILD_DATE=`date -u +%Y-%m-%dT%H:%M:%SZ` >> $GITHUB_ENV
-      - uses: goreleaser/goreleaser-action@v4
+      - name: Release binary
+        uses: goreleaser/goreleaser-action@v4
         with:
           distribution: goreleaser
           version: latest
