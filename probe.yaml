@@ -1,0 +1,9 @@
+# Probe request defaults for cmd/probe_host.
+# This file is optional. If it is missing, built-in defaults are used.
+
+prompt: "ping"
+user-agent: "cli-proxy-probe-host/1.0"
+timeout: 30
+
+# Optional headers added to every probe request.
+headers: {}
