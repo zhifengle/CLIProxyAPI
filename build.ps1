@@ -5,22 +5,19 @@ param(
     [string]$Version = "",
     [ValidateSet("amd64", "arm64")]
     [string]$GoArch = "amd64",
-    [switch]$SkipModelsRefresh,
-    [switch]$KeepRefreshedModels,
+    [switch]$DownloadModels,
     [switch]$Package
 )
 
 # build.ps1 - Local Windows build script aligned with the GitHub release workflow.
 #
-# By default the script:
-#   1. Refreshes the embedded models catalog from router-for-me/models.
-#   2. Injects Version / Commit / BuildDate via ldflags.
-#   3. Restores models.json after the build so the worktree stays clean.
+# By default the script builds the Windows binary using the local embedded models catalog.
+# Pass -DownloadModels to refresh internal/registry/models/models.json from router-for-me/models.
 #
 # Examples:
 #   ./build.ps1
 #   ./build.ps1 -Version v6.0.0-local
-#   ./build.ps1 -SkipModelsRefresh
+#   ./build.ps1 -DownloadModels
 #   ./build.ps1 -Package
 
 Set-StrictMode -Version Latest
@@ -46,6 +43,31 @@ function Write-Info {
     )
 
     Write-Host "[build] $Message"
+}
+
+function Update-ModelsCatalog {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ModelsPath
+    )
+
+    Write-Info "Refreshing embedded models catalog from router-for-me/models"
+
+    & git fetch --depth 1 https://github.com/router-for-me/models.git main
+    if ($LASTEXITCODE -ne 0) {
+        throw "git fetch for models catalog failed."
+    }
+
+    $remoteModels = & git show FETCH_HEAD:models.json 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        throw "git show FETCH_HEAD:models.json failed.`n$remoteModels"
+    }
+
+    $modelsText = (($remoteModels | ForEach-Object { [string]$_ }) -join "`n")
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($ModelsPath, $modelsText, $utf8NoBom)
+
+    Write-Info ("Models catalog updated: {0}" -f $ModelsPath)
 }
 
 function New-PackageArchive {
@@ -102,34 +124,19 @@ $repoRoot = Invoke-Git -Arguments @("rev-parse", "--show-toplevel")
 Set-Location $repoRoot
 
 $modelsPath = Join-Path $repoRoot "internal/registry/models/models.json"
-$modelsBackupPath = Join-Path ([System.IO.Path]::GetTempPath()) ("cliproxy-models-backup-" + [Guid]::NewGuid().ToString("N") + ".json")
-$modelsBackedUp = $false
 
 $oldCgoEnabled = $env:CGO_ENABLED
 $oldGoos = $env:GOOS
 $oldGoarch = $env:GOARCH
 
 try {
-    if (-not $SkipModelsRefresh) {
-        Write-Info "Refreshing embedded models catalog from router-for-me/models"
-        Copy-Item -LiteralPath $modelsPath -Destination $modelsBackupPath -Force
-        $modelsBackedUp = $true
+    if ($DownloadModels) {
+        Update-ModelsCatalog -ModelsPath $modelsPath
+        return
+    }
 
-        & git fetch --depth 1 https://github.com/router-for-me/models.git main
-        if ($LASTEXITCODE -ne 0) {
-            throw "git fetch for models catalog failed."
-        }
-
-        $remoteModels = & git show FETCH_HEAD:models.json 2>&1
-        if ($LASTEXITCODE -ne 0) {
-            throw "git show FETCH_HEAD:models.json failed.`n$remoteModels"
-        }
-
-        $modelsText = (($remoteModels | ForEach-Object { [string]$_ }) -join "`n")
-        $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-        [System.IO.File]::WriteAllText($modelsPath, $modelsText, $utf8NoBom)
-    } else {
-        Write-Info "Skipping models catalog refresh"
+    if (-not (Test-Path -LiteralPath $modelsPath)) {
+        throw "models.json not found at $modelsPath. Run ./build.ps1 -DownloadModels first."
     }
 
     if ([string]::IsNullOrWhiteSpace($Version)) {
@@ -175,13 +182,6 @@ try {
     }
 }
 finally {
-    if ($modelsBackedUp -and -not $KeepRefreshedModels -and (Test-Path -LiteralPath $modelsBackupPath)) {
-        Copy-Item -LiteralPath $modelsBackupPath -Destination $modelsPath -Force
-    }
-    if (Test-Path -LiteralPath $modelsBackupPath) {
-        Remove-Item -LiteralPath $modelsBackupPath -Force
-    }
-
     $env:CGO_ENABLED = $oldCgoEnabled
     $env:GOOS = $oldGoos
     $env:GOARCH = $oldGoarch
