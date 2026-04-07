@@ -788,6 +788,9 @@ func (h *BaseAPIHandler) getRequestDetails(modelName string) (providers []string
 	} else {
 		resolvedModelName = util.ResolveAutoModel(modelName)
 	}
+	if h != nil && h.AuthManager != nil {
+		resolvedModelName = h.AuthManager.ResolveRequestModel(resolvedModelName)
+	}
 
 	parsed := thinking.ParseSuffix(resolvedModelName)
 	baseModel := strings.TrimSpace(parsed.ModelName)

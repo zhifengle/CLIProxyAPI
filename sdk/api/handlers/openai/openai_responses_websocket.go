@@ -496,6 +496,9 @@ func (h *OpenAIResponsesAPIHandler) websocketUpstreamSupportsIncrementalInputFor
 	} else {
 		resolvedModelName = util.ResolveAutoModel(modelName)
 	}
+	if h != nil && h.AuthManager != nil {
+		resolvedModelName = h.AuthManager.ResolveRequestModel(resolvedModelName)
+	}
 
 	parsed := thinking.ParseSuffix(resolvedModelName)
 	baseModel := strings.TrimSpace(parsed.ModelName)

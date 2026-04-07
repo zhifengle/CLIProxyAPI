@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
@@ -20,6 +21,7 @@ func TestGetRequestDetails_PreservesSuffix(t *testing.T) {
 	})
 	modelRegistry.RegisterClient("test-request-details-openai", "openai", []*registry.ModelInfo{
 		{ID: "gpt-5.2", Created: now + 20},
+		{ID: "gpt-5.4-mini", Created: now + 15},
 	})
 	modelRegistry.RegisterClient("test-request-details-claude", "claude", []*registry.ModelInfo{
 		{ID: "claude-sonnet-4-5", Created: now + 5},
@@ -38,7 +40,13 @@ func TestGetRequestDetails_PreservesSuffix(t *testing.T) {
 		})
 	}
 
-	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, coreauth.NewManager(nil, nil, nil))
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.SetConfig(&internalconfig.Config{
+		GlobalModelMappings: []internalconfig.GlobalModelMapping{
+			{From: "gpt-5-nano", To: "gpt-5.4-mini"},
+		},
+	})
+	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
 
 	tests := []struct {
 		name          string
@@ -59,6 +67,13 @@ func TestGetRequestDetails_PreservesSuffix(t *testing.T) {
 			inputModel:    "gpt-5.2(high)",
 			wantProviders: []string{"openai"},
 			wantModel:     "gpt-5.2(high)",
+			wantErr:       false,
+		},
+		{
+			name:          "global model mapping rewrites before provider lookup",
+			inputModel:    "gpt-5-nano(high)",
+			wantProviders: []string{"openai"},
+			wantModel:     "gpt-5.4-mini(high)",
 			wantErr:       false,
 		},
 		{

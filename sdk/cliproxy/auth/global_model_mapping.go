@@ -79,6 +79,18 @@ func (m *Manager) applyGlobalModelMapping(requestedModel string) string {
 	return resolved
 }
 
+// ResolveRequestModel applies global request-time model rewrites and returns the effective model.
+func (m *Manager) ResolveRequestModel(requestedModel string) string {
+	requestedModel = strings.TrimSpace(requestedModel)
+	if requestedModel == "" {
+		return ""
+	}
+	if m == nil {
+		return requestedModel
+	}
+	return m.applyGlobalModelMapping(requestedModel)
+}
+
 func (m *Manager) resolveGlobalMappedModel(requestedModel string) string {
 	if m == nil {
 		return ""
