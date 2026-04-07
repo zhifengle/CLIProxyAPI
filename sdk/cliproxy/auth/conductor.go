@@ -147,6 +147,9 @@ type Manager struct {
 	// oauthModelAlias stores global OAuth model alias mappings (alias -> upstream name) keyed by channel.
 	oauthModelAlias atomic.Value
 
+	// globalModelMappings stores compiled global request-time model rewrite rules.
+	globalModelMappings atomic.Value
+
 	// apiKeyModelAlias caches resolved model alias mappings for API-key auths.
 	// Keyed by auth.ID, value is alias(lower) -> upstream model (including suffix).
 	apiKeyModelAlias atomic.Value
@@ -186,6 +189,7 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 	}
 	// atomic.Value requires non-nil initial value.
 	manager.runtimeConfig.Store(&internalconfig.Config{})
+	manager.globalModelMappings.Store(&globalModelMappingTable{})
 	manager.apiKeyModelAlias.Store(apiKeyModelAliasTable(nil))
 	manager.scheduler = newAuthScheduler(selector)
 	return manager
@@ -274,6 +278,7 @@ func (m *Manager) SetConfig(cfg *internalconfig.Config) {
 		cfg = &internalconfig.Config{}
 	}
 	m.runtimeConfig.Store(cfg)
+	m.SetGlobalModelMappings(cfg.GlobalModelMappings)
 	m.rebuildAPIKeyModelAliasFromRuntimeConfig()
 }
 
@@ -423,6 +428,7 @@ func preserveRequestedModelSuffix(requestedModel, resolved string) string {
 
 func (m *Manager) executionModelCandidates(auth *Auth, routeModel string) []string {
 	requestedModel := rewriteModelForAuth(routeModel, auth)
+	requestedModel = m.applyGlobalModelMapping(requestedModel)
 	requestedModel = m.applyOAuthModelAlias(auth, requestedModel)
 	if pool := m.resolveOpenAICompatUpstreamModelPool(auth, requestedModel); len(pool) > 0 {
 		if len(pool) == 1 {
@@ -443,6 +449,7 @@ func (m *Manager) selectionModelForAuth(auth *Auth, routeModel string) string {
 	if strings.TrimSpace(requestedModel) == "" {
 		requestedModel = strings.TrimSpace(routeModel)
 	}
+	requestedModel = m.applyGlobalModelMapping(requestedModel)
 	resolvedModel := m.applyOAuthModelAlias(auth, requestedModel)
 	if strings.TrimSpace(resolvedModel) == "" {
 		resolvedModel = requestedModel

@@ -284,6 +284,18 @@ nonstream-keepalive-interval: 0
 #     - from: "claude-haiku-4-5-20251001"
 #       to: "gemini-2.5-flash"
 
+# Global request-time model rewrites
+# These rules rewrite the requested model before any OAuth alias or per-credential alias runs.
+# They affect request routing globally across providers and auth types.
+# Exact matches run first. Regex rules run after exact matches in the order listed.
+# Thinking suffixes are preserved unless the target already includes its own suffix.
+# global-model-mappings:
+#   - from: "gpt-5-nano"
+#     to: "gpt-5.4-mini"
+#   - from: "^claude-opus-4-5.*$"
+#     to: "claude-sonnet-4-5-20250929"
+#     regex: true
+#
 # Global OAuth model name aliases (per channel)
 # These aliases rename model IDs for both model listing and request routing.
 # Supported channels: gemini-cli, vertex, aistudio, antigravity, claude, codex, qwen, iflow, kimi.
