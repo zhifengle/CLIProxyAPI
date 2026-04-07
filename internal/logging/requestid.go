@@ -13,6 +13,7 @@ type requestIDKey struct{}
 
 // ginRequestIDKey is the Gin context key for request IDs.
 const ginRequestIDKey = "__request_id__"
+const ginBaseURLKey = "__base_url__"
 
 // GenerateRequestID creates a new 8-character hex request ID.
 func GenerateRequestID() string {
@@ -54,6 +55,26 @@ func GetGinRequestID(c *gin.Context) string {
 	}
 	if id, exists := c.Get(ginRequestIDKey); exists {
 		if s, ok := id.(string); ok {
+			return s
+		}
+	}
+	return ""
+}
+
+// SetGinBaseURL stores the selected config base URL in the Gin context.
+func SetGinBaseURL(c *gin.Context, baseURL string) {
+	if c != nil {
+		c.Set(ginBaseURLKey, baseURL)
+	}
+}
+
+// GetGinBaseURL retrieves the selected config base URL from the Gin context.
+func GetGinBaseURL(c *gin.Context) string {
+	if c == nil {
+		return ""
+	}
+	if raw, exists := c.Get(ginBaseURLKey); exists {
+		if s, ok := raw.(string); ok {
 			return s
 		}
 	}

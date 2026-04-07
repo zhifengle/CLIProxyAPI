@@ -76,6 +76,12 @@ func WithSelectedAuthIDCallback(ctx context.Context, callback func(string)) cont
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if existing := selectedAuthIDCallbackFromContext(ctx); existing != nil {
+		return context.WithValue(ctx, selectedAuthCallbackContextKey{}, func(authID string) {
+			existing(authID)
+			callback(authID)
+		})
+	}
 	return context.WithValue(ctx, selectedAuthCallbackContextKey{}, callback)
 }
 
@@ -351,6 +357,13 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 	}
 	newCtx = context.WithValue(newCtx, "gin", c)
 	newCtx = context.WithValue(newCtx, "handler", handler)
+	if c != nil && h != nil && h.AuthManager != nil {
+		newCtx = WithSelectedAuthIDCallback(newCtx, func(authID string) {
+			if baseURL := h.selectedAuthBaseURL(authID); baseURL != "" {
+				logging.SetGinBaseURL(c, baseURL)
+			}
+		})
+	}
 	return newCtx, func(params ...interface{}) {
 		if h.Cfg.RequestLog && len(params) == 1 {
 			if existing, exists := c.Get("API_RESPONSE"); exists {
@@ -390,6 +403,37 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 
 		cancel()
 	}
+}
+
+func (h *BaseAPIHandler) selectedAuthBaseURL(authID string) string {
+	if h == nil || h.AuthManager == nil {
+		return ""
+	}
+	authID = strings.TrimSpace(authID)
+	if authID == "" {
+		return ""
+	}
+	auth, ok := h.AuthManager.GetByID(authID)
+	if !ok || auth == nil {
+		return ""
+	}
+	if auth.Attributes != nil {
+		if baseURL := strings.TrimSpace(auth.Attributes["base_url"]); baseURL != "" {
+			return baseURL
+		}
+		if baseURL := strings.TrimSpace(auth.Attributes["base-url"]); baseURL != "" {
+			return baseURL
+		}
+	}
+	if auth.Metadata != nil {
+		if baseURL, ok := auth.Metadata["base_url"].(string); ok && strings.TrimSpace(baseURL) != "" {
+			return strings.TrimSpace(baseURL)
+		}
+		if baseURL, ok := auth.Metadata["base-url"].(string); ok && strings.TrimSpace(baseURL) != "" {
+			return strings.TrimSpace(baseURL)
+		}
+	}
+	return ""
 }
 
 // StartNonStreamingKeepAlive emits blank lines every 5 seconds while waiting for a non-streaming response.

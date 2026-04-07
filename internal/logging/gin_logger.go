@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"runtime/debug"
 	"strings"
 	"time"
@@ -70,14 +71,15 @@ func GinLogrusLogger() gin.HandlerFunc {
 		}
 
 		statusCode := c.Writer.Status()
-		clientIP := c.ClientIP()
-		method := c.Request.Method
 		errorMessage := c.Errors.ByType(gin.ErrorTypePrivate).String()
 
 		if requestID == "" {
 			requestID = "--------"
 		}
-		logLine := fmt.Sprintf("%3d | %13v | %15s | %-7s \"%s\"", statusCode, latency, clientIP, method, path)
+		logLine := fmt.Sprintf("%3d | %13v | %s", statusCode, latency, path)
+		if baseURLHost := extractBaseURLHost(c); baseURLHost != "" {
+			logLine += " | " + baseURLHost
+		}
 		if errorMessage != "" {
 			logLine = logLine + " | " + errorMessage
 		}
@@ -147,4 +149,29 @@ func shouldSkipGinRequestLogging(c *gin.Context) bool {
 	}
 	flag, ok := val.(bool)
 	return ok && flag
+}
+
+func extractBaseURLHost(c *gin.Context) string {
+	if c == nil {
+		return ""
+	}
+	rawURL := strings.TrimSpace(GetGinBaseURL(c))
+	if rawURL == "" {
+		return ""
+	}
+	return parseBaseURLHost(rawURL)
+}
+
+func parseBaseURLHost(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	if parsed, err := url.Parse(raw); err == nil && strings.TrimSpace(parsed.Host) != "" {
+		return strings.TrimSpace(parsed.Host)
+	}
+	if parsed, err := url.Parse("https://" + raw); err == nil && strings.TrimSpace(parsed.Host) != "" {
+		return strings.TrimSpace(parsed.Host)
+	}
+	return ""
 }
