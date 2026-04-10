@@ -510,7 +510,7 @@ func cloneHeaders(src map[string]string) map[string]string {
 
 func hostMatches(rawBaseURL, rawHost string) bool {
 	baseHost, baseHostPort := normalizeURLHost(rawBaseURL)
-	targetHost, targetHostPort := normalizeInputHost(rawHost)
+	targetHost, targetHostPort := extractHostFromInput(rawHost)
 	if targetHost == "" {
 		return false
 	}
@@ -535,35 +535,41 @@ func normalizeURLHost(raw string) (string, string) {
 	return strings.ToLower(parsed.Hostname()), strings.ToLower(parsed.Host)
 }
 
-func normalizeInputHost(raw string) (string, string) {
+// extractHostFromInput accepts a plain hostname, host:port, or a full URL
+// and returns (hostname, host:port). When the input is a URL the path and
+// other components are ignored so that e.g. "https://api.example.com/v1"
+// and "api.example.com" both resolve to the same host for comparison.
+func extractHostFromInput(raw string) (string, string) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return "", ""
 	}
 
-	tryParse := func(value string) (string, string) {
-		parsed, err := url.Parse(value)
+	// Full URL – has a scheme.
+	if strings.Contains(raw, "://") {
+		parsed, err := url.Parse(raw)
 		if err != nil {
 			return "", ""
 		}
-		host := strings.ToLower(parsed.Hostname())
-		hostPort := strings.ToLower(parsed.Host)
-		if host == "" && parsed.Path != "" && !strings.Contains(parsed.Path, "/") {
-			host = strings.ToLower(parsed.Path)
-			hostPort = strings.ToLower(parsed.Path)
-		}
-		return host, hostPort
+		return strings.ToLower(parsed.Hostname()), strings.ToLower(parsed.Host)
 	}
 
-	if strings.Contains(raw, "://") {
-		return tryParse(raw)
+	// Looks like host:port or plain host – prepend a scheme so url.Parse
+	// can split host from port correctly.
+	parsed, err := url.Parse("https://" + raw)
+	if err != nil {
+		return "", ""
 	}
-	if host, hostPort := tryParse("https://" + raw); host != "" {
-		return host, hostPort
-	}
+	hostname := strings.ToLower(parsed.Hostname())
+	hostPort := strings.ToLower(parsed.Host)
 
-	trimmed := strings.Trim(strings.ToLower(raw), "/")
-	return trimmed, trimmed
+	// url.Parse may put a path-only value into Path instead of Host when
+	// there are no slashes; fall back to the raw trimmed value in that case.
+	if hostname == "" {
+		trimmed := strings.ToLower(strings.Trim(raw, "/"))
+		return trimmed, trimmed
+	}
+	return hostname, hostPort
 }
 
 func mergeHeadersIntoAttrs(attrs map[string]string, headers map[string]string) {

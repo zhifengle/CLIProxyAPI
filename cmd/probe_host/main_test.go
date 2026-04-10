@@ -191,6 +191,131 @@ func TestCollectTargetsUsesFirstModelAndIgnoresExcludedModels(t *testing.T) {
 	}
 }
 
+func TestExtractHostFromInput(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		input        string
+		wantHost     string
+		wantHostPort string
+	}{
+		// plain hostname
+		{"example.com", "example.com", "example.com"},
+		// hostname with port
+		{"example.com:8080", "example.com", "example.com:8080"},
+		// full URL – path should be ignored
+		{"https://api.example.com/v1", "api.example.com", "api.example.com"},
+		// full URL with port
+		{"https://api.example.com:9000/v1/chat", "api.example.com", "api.example.com:9000"},
+		// http scheme
+		{"http://proxy.internal/", "proxy.internal", "proxy.internal"},
+		// URL with only scheme+host
+		{"https://example.com", "example.com", "example.com"},
+		// empty
+		{"", "", ""},
+		// whitespace only
+		{"   ", "", ""},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.input, func(t *testing.T) {
+			t.Parallel()
+			gotHost, gotHostPort := extractHostFromInput(tc.input)
+			if gotHost != tc.wantHost {
+				t.Errorf("extractHostFromInput(%q) host = %q, want %q", tc.input, gotHost, tc.wantHost)
+			}
+			if gotHostPort != tc.wantHostPort {
+				t.Errorf("extractHostFromInput(%q) hostPort = %q, want %q", tc.input, gotHostPort, tc.wantHostPort)
+			}
+		})
+	}
+}
+
+func TestHostMatches(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		baseURL string
+		input   string
+		want    bool
+	}{
+		// plain hostname matches base URL
+		{"https://api.example.com/v1", "api.example.com", true},
+		// full URL input matches base URL
+		{"https://api.example.com/v1", "https://api.example.com/v1", true},
+		// full URL with different path still matches same host
+		{"https://api.example.com/v1", "https://api.example.com/other/path", true},
+		// different host does not match
+		{"https://api.example.com/v1", "other.example.com", false},
+		// port in base URL must match when input includes port
+		{"https://api.example.com:9000/v1", "api.example.com:9000", true},
+		// port mismatch: hostname still matches (port is only checked when input includes port AND base has same port)
+		{"https://api.example.com:9000/v1", "api.example.com:8080", true},
+		// hostname without port matches base URL that has a port (hostname-only comparison)
+		{"https://api.example.com:9000/v1", "api.example.com", true},
+		// empty input never matches
+		{"https://api.example.com/v1", "", false},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(fmt.Sprintf("%s|%s", tc.baseURL, tc.input), func(t *testing.T) {
+			t.Parallel()
+			got := hostMatches(tc.baseURL, tc.input)
+			if got != tc.want {
+				t.Errorf("hostMatches(%q, %q) = %v, want %v", tc.baseURL, tc.input, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestRunAcceptsURLAsHostFlag(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{
+				{"message": map[string]string{"role": "assistant", "content": "pong"}},
+			},
+		})
+	}))
+	defer server.Close()
+
+	configBody := fmt.Sprintf(`proxy-url: "direct"
+openai-compatibility:
+  - name: "url-test"
+    base-url: "%s/v1"
+    api-key-entries:
+      - api-key: "test-key"
+        proxy-url: "direct"
+    models:
+      - name: "test-model"
+`, server.URL)
+
+	tempDir := t.TempDir()
+	configPath := filepath.Join(tempDir, "config.yaml")
+	if err := os.WriteFile(configPath, []byte(configBody), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	// Pass the full server URL (with path) as the -host argument.
+	fullURL := server.URL + "/v1"
+	err := run([]string{"-config", configPath, "-host", fullURL}, &stdout, &stderr)
+	if err != nil {
+		t.Fatalf("run returned error: %v\nstderr:\n%s\nstdout:\n%s", err, stderr.String(), stdout.String())
+	}
+
+	got := stdout.String()
+	if !strings.Contains(got, "status: ok") {
+		t.Fatalf("expected status ok\noutput:\n%s", got)
+	}
+}
+
 func TestLoadProbeSettingsUsesDefaultsWhenMissing(t *testing.T) {
 	t.Parallel()
 
