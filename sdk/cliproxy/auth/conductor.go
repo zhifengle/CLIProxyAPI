@@ -3108,6 +3108,9 @@ func debugLogAuthSelection(entry *log.Entry, auth *Auth, provider string, model 
 	if proxyInfo != "" {
 		suffix = " " + proxyInfo
 	}
+	if baseURL := authBaseURL(auth); baseURL != "" {
+		suffix += " base_url=" + baseURL
+	}
 	switch accountType {
 	case "api_key":
 		entry.Debugf("Use API key %s for model %s%s", util.HideAPIKey(accountInfo), model, suffix)
@@ -3115,6 +3118,36 @@ func debugLogAuthSelection(entry *log.Entry, auth *Auth, provider string, model 
 		ident := formatOauthIdentity(auth, provider, accountInfo)
 		entry.Debugf("Use OAuth %s for model %s%s", ident, model, suffix)
 	}
+}
+
+// authBaseURL returns the base_url from an Auth's Attributes or Metadata.
+// It checks Attributes["base_url"], Attributes["base-url"], Metadata["base_url"],
+// Metadata["base-url"] in order, returning the first non-empty trimmed value.
+func authBaseURL(auth *Auth) string {
+	if auth == nil {
+		return ""
+	}
+	if auth.Attributes != nil {
+		if v := strings.TrimSpace(auth.Attributes["base_url"]); v != "" {
+			return v
+		}
+		if v := strings.TrimSpace(auth.Attributes["base-url"]); v != "" {
+			return v
+		}
+	}
+	if auth.Metadata != nil {
+		if v, ok := auth.Metadata["base_url"].(string); ok {
+			if v = strings.TrimSpace(v); v != "" {
+				return v
+			}
+		}
+		if v, ok := auth.Metadata["base-url"].(string); ok {
+			if v = strings.TrimSpace(v); v != "" {
+				return v
+			}
+		}
+	}
+	return ""
 }
 
 func formatOauthIdentity(auth *Auth, provider string, accountInfo string) string {
