@@ -64,8 +64,13 @@ const (
 	refreshMaxConcurrency = 16
 	refreshPendingBackoff = time.Minute
 	refreshFailureBackoff = 5 * time.Minute
-	quotaBackoffBase      = time.Second
-	quotaBackoffMax       = 30 * time.Minute
+	// refreshIneffectiveBackoff throttles refresh attempts when an executor returns
+	// success but the auth still evaluates as needing refresh (e.g. token expiry
+	// wasn't updated). Without this guard, the auto-refresh loop can tight-loop and
+	// burn CPU at idle.
+	refreshIneffectiveBackoff = 30 * time.Second
+	quotaBackoffBase          = time.Second
+	quotaBackoffMax           = 30 * time.Minute
 )
 
 var quotaCooldownDisabled atomic.Bool
@@ -103,6 +108,13 @@ type Result struct {
 // Selector chooses an auth candidate for execution.
 type Selector interface {
 	Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error)
+}
+
+// StoppableSelector is an optional interface for selectors that hold resources.
+// Selectors that implement this interface will have Stop called during shutdown.
+type StoppableSelector interface {
+	Selector
+	Stop()
 }
 
 // Hook captures lifecycle callbacks for observing auth changes.
@@ -165,8 +177,8 @@ type Manager struct {
 	rtProvider RoundTripperProvider
 
 	// Auto refresh state
-	refreshCancel    context.CancelFunc
-	refreshSemaphore chan struct{}
+	refreshCancel context.CancelFunc
+	refreshLoop   *authAutoRefreshLoop
 }
 
 // NewManager constructs a manager with optional custom selector and hook.
@@ -185,7 +197,6 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		auths:            make(map[string]*Auth),
 		providerOffsets:  make(map[string]int),
 		modelPoolOffsets: make(map[string]int),
-		refreshSemaphore: make(chan struct{}, refreshMaxConcurrency),
 	}
 	// atomic.Value requires non-nil initial value.
 	manager.runtimeConfig.Store(&internalconfig.Config{})
@@ -218,6 +229,16 @@ func (m *Manager) syncScheduler() {
 	m.syncSchedulerFromSnapshot(m.snapshotAuths())
 }
 
+func (m *Manager) snapshotAuths() []*Auth {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]*Auth, 0, len(m.auths))
+	for _, a := range m.auths {
+		out = append(out, a.Clone())
+	}
+	return out
+}
+
 // RefreshSchedulerEntry re-upserts a single auth into the scheduler so that its
 // supportedModelSet is rebuilt from the current global model registry state.
 // This must be called after models have been registered for a newly added auth,
@@ -236,6 +257,84 @@ func (m *Manager) RefreshSchedulerEntry(authID string) {
 	snapshot := auth.Clone()
 	m.mu.RUnlock()
 	m.scheduler.upsertAuth(snapshot)
+}
+
+// ReconcileRegistryModelStates aligns per-model runtime state with the current
+// registry snapshot for one auth.
+//
+// Supported models are reset to a clean state because re-registration already
+// cleared the registry-side cooldown/suspension snapshot. ModelStates for
+// models that are no longer present in the registry are pruned entirely so
+// renamed/removed models cannot keep auth-level status stale.
+func (m *Manager) ReconcileRegistryModelStates(ctx context.Context, authID string) {
+	if m == nil || authID == "" {
+		return
+	}
+
+	supportedModels := registry.GetGlobalRegistry().GetModelsForClient(authID)
+	supported := make(map[string]struct{}, len(supportedModels))
+	for _, model := range supportedModels {
+		if model == nil {
+			continue
+		}
+		modelKey := canonicalModelKey(model.ID)
+		if modelKey == "" {
+			continue
+		}
+		supported[modelKey] = struct{}{}
+	}
+
+	var snapshot *Auth
+	now := time.Now()
+
+	m.mu.Lock()
+	auth, ok := m.auths[authID]
+	if ok && auth != nil && len(auth.ModelStates) > 0 {
+		changed := false
+		for modelKey, state := range auth.ModelStates {
+			baseModel := canonicalModelKey(modelKey)
+			if baseModel == "" {
+				baseModel = strings.TrimSpace(modelKey)
+			}
+			if _, supportedModel := supported[baseModel]; !supportedModel {
+				// Drop state for models that disappeared from the current registry
+				// snapshot. Keeping them around leaks stale errors into auth-level
+				// status, management output, and websocket fallback checks.
+				delete(auth.ModelStates, modelKey)
+				changed = true
+				continue
+			}
+			if state == nil {
+				continue
+			}
+			if modelStateIsClean(state) {
+				continue
+			}
+			resetModelState(state, now)
+			changed = true
+		}
+		if len(auth.ModelStates) == 0 {
+			auth.ModelStates = nil
+		}
+		if changed {
+			updateAggregatedAvailability(auth, now)
+			if !hasModelError(auth, now) {
+				auth.LastError = nil
+				auth.StatusMessage = ""
+				auth.Status = StatusActive
+			}
+			auth.UpdatedAt = now
+			if errPersist := m.persist(ctx, auth); errPersist != nil {
+				logEntryWithRequestID(ctx).WithField("auth_id", auth.ID).Warnf("failed to persist auth changes during model state reconciliation: %v", errPersist)
+			}
+			snapshot = auth.Clone()
+		}
+	}
+	m.mu.Unlock()
+
+	if m.scheduler != nil && snapshot != nil {
+		m.scheduler.upsertAuth(snapshot)
+	}
 }
 
 func (m *Manager) SetSelector(selector Selector) {
@@ -1017,6 +1116,7 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	if m.scheduler != nil {
 		m.scheduler.upsertAuth(authClone)
 	}
+	m.queueRefreshReschedule(auth.ID)
 	_ = m.persist(ctx, auth)
 	m.hook.OnAuthRegistered(ctx, auth.Clone())
 	return auth.Clone(), nil
@@ -1047,6 +1147,7 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	if m.scheduler != nil {
 		m.scheduler.upsertAuth(authClone)
 	}
+	m.queueRefreshReschedule(auth.ID)
 	_ = m.persist(ctx, auth)
 	m.hook.OnAuthUpdated(ctx, auth.Clone())
 	return auth.Clone(), nil
@@ -1108,12 +1209,16 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
 		}
 	}
 	if lastErr != nil {
+		if shouldAttemptAntigravityCreditsFallback(m, lastErr, normalized) {
+			if resp, ok := m.tryAntigravityCreditsExecute(ctx, req, opts); ok {
+				return resp, nil
+			}
+		}
 		return cliproxyexecutor.Response{}, lastErr
 	}
 	return cliproxyexecutor.Response{}, &Error{Code: "auth_not_found", Message: "no auth available"}
 }
 
-// ExecuteCount performs a non-streaming execution using the configured selector and executor.
 // It supports multiple providers for the same model and round-robins the starting provider per model.
 func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
 	normalized := m.normalizeProviders(providers)
@@ -1170,6 +1275,11 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 		}
 	}
 	if lastErr != nil {
+		if shouldAttemptAntigravityCreditsFallback(m, lastErr, normalized) {
+			if result, ok := m.tryAntigravityCreditsExecuteStream(ctx, req, opts); ok {
+				return result, nil
+			}
+		}
 		return nil, lastErr
 	}
 	return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
@@ -1759,7 +1869,11 @@ func (m *Manager) closestCooldownWait(providers []string, model string, attempt 
 		if attempt >= effectiveRetry {
 			continue
 		}
-		blocked, reason, next := isAuthBlockedForModel(auth, model, now)
+		checkModel := model
+		if strings.TrimSpace(model) != "" {
+			checkModel = m.selectionModelForAuth(auth, model)
+		}
+		blocked, reason, next := isAuthBlockedForModel(auth, checkModel, now)
 		if !blocked || next.IsZero() || reason == blockReasonDisabled {
 			continue
 		}
@@ -1775,6 +1889,50 @@ func (m *Manager) closestCooldownWait(providers []string, model string, attempt 
 	return minWait, found
 }
 
+func (m *Manager) retryAllowed(attempt int, providers []string) bool {
+	if m == nil || attempt < 0 || len(providers) == 0 {
+		return false
+	}
+	defaultRetry := int(m.requestRetry.Load())
+	if defaultRetry < 0 {
+		defaultRetry = 0
+	}
+	providerSet := make(map[string]struct{}, len(providers))
+	for i := range providers {
+		key := strings.TrimSpace(strings.ToLower(providers[i]))
+		if key == "" {
+			continue
+		}
+		providerSet[key] = struct{}{}
+	}
+	if len(providerSet) == 0 {
+		return false
+	}
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, auth := range m.auths {
+		if auth == nil {
+			continue
+		}
+		providerKey := strings.TrimSpace(strings.ToLower(auth.Provider))
+		if _, ok := providerSet[providerKey]; !ok {
+			continue
+		}
+		effectiveRetry := defaultRetry
+		if override, ok := auth.RequestRetryOverride(); ok {
+			effectiveRetry = override
+		}
+		if effectiveRetry < 0 {
+			effectiveRetry = 0
+		}
+		if attempt < effectiveRetry {
+			return true
+		}
+	}
+	return false
+}
+
 func (m *Manager) shouldRetryAfterError(err error, attempt int, providers []string, model string, maxWait time.Duration) (time.Duration, bool) {
 	if err == nil {
 		return 0, false
@@ -1782,17 +1940,31 @@ func (m *Manager) shouldRetryAfterError(err error, attempt int, providers []stri
 	if maxWait <= 0 {
 		return 0, false
 	}
-	if status := statusCodeFromError(err); status == http.StatusOK {
+	status := statusCodeFromError(err)
+	if status == http.StatusOK {
 		return 0, false
 	}
 	if isRequestInvalidError(err) {
 		return 0, false
 	}
 	wait, found := m.closestCooldownWait(providers, model, attempt)
-	if !found || wait > maxWait {
+	if found {
+		if wait > maxWait {
+			return 0, false
+		}
+		return wait, true
+	}
+	if status != http.StatusTooManyRequests {
 		return 0, false
 	}
-	return wait, true
+	if !m.retryAllowed(attempt, providers) {
+		return 0, false
+	}
+	retryAfter := retryAfterFromError(err)
+	if retryAfter == nil || *retryAfter <= 0 || *retryAfter > maxWait {
+		return 0, false
+	}
+	return *retryAfter, true
 }
 
 func waitForCooldown(ctx context.Context, wait time.Duration) error {
@@ -1845,6 +2017,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		} else {
 			if result.Model != "" {
 				if !isRequestScopedNotFoundResultError(result.Error) {
+					disableCooling := quotaCooldownDisabledForAuth(auth)
 					state := ensureModelState(auth, result.Model)
 					state.Unavailable = true
 					state.Status = StatusError
@@ -1865,31 +2038,45 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 					} else {
 						switch statusCode {
 						case 401:
-							next := now.Add(30 * time.Minute)
-							state.NextRetryAfter = next
-							suspendReason = "unauthorized"
-							shouldSuspendModel = true
+							if disableCooling {
+								state.NextRetryAfter = time.Time{}
+							} else {
+								next := now.Add(30 * time.Minute)
+								state.NextRetryAfter = next
+								suspendReason = "unauthorized"
+								shouldSuspendModel = true
+							}
 						case 402, 403:
-							next := now.Add(30 * time.Minute)
-							state.NextRetryAfter = next
-							suspendReason = "payment_required"
-							shouldSuspendModel = true
+							if disableCooling {
+								state.NextRetryAfter = time.Time{}
+							} else {
+								next := now.Add(30 * time.Minute)
+								state.NextRetryAfter = next
+								suspendReason = "payment_required"
+								shouldSuspendModel = true
+							}
 						case 404:
-							next := now.Add(12 * time.Hour)
-							state.NextRetryAfter = next
-							suspendReason = "not_found"
-							shouldSuspendModel = true
+							if disableCooling {
+								state.NextRetryAfter = time.Time{}
+							} else {
+								next := now.Add(12 * time.Hour)
+								state.NextRetryAfter = next
+								suspendReason = "not_found"
+								shouldSuspendModel = true
+							}
 						case 429:
 							var next time.Time
 							backoffLevel := state.Quota.BackoffLevel
-							if result.RetryAfter != nil {
-								next = now.Add(*result.RetryAfter)
-							} else {
-								cooldown, nextLevel := nextQuotaCooldown(backoffLevel, quotaCooldownDisabledForAuth(auth))
-								if cooldown > 0 {
-									next = now.Add(cooldown)
+							if !disableCooling {
+								if result.RetryAfter != nil {
+									next = now.Add(*result.RetryAfter)
+								} else {
+									cooldown, nextLevel := nextQuotaCooldown(backoffLevel, disableCooling)
+									if cooldown > 0 {
+										next = now.Add(cooldown)
+									}
+									backoffLevel = nextLevel
 								}
-								backoffLevel = nextLevel
 							}
 							state.NextRetryAfter = next
 							state.Quota = QuotaState{
@@ -1898,11 +2085,13 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 								NextRecoverAt: next,
 								BackoffLevel:  backoffLevel,
 							}
-							suspendReason = "quota"
-							shouldSuspendModel = true
-							setModelQuota = true
+							if !disableCooling {
+								suspendReason = "quota"
+								shouldSuspendModel = true
+								setModelQuota = true
+							}
 						case 408, 500, 502, 503, 504:
-							if quotaCooldownDisabledForAuth(auth) {
+							if disableCooling {
 								state.NextRetryAfter = time.Time{}
 							} else {
 								next := now.Add(1 * time.Minute)
@@ -1973,8 +2162,28 @@ func resetModelState(state *ModelState, now time.Time) {
 	state.UpdatedAt = now
 }
 
+func modelStateIsClean(state *ModelState) bool {
+	if state == nil {
+		return true
+	}
+	if state.Status != StatusActive {
+		return false
+	}
+	if state.Unavailable || state.StatusMessage != "" || !state.NextRetryAfter.IsZero() || state.LastError != nil {
+		return false
+	}
+	if state.Quota.Exceeded || state.Quota.Reason != "" || !state.Quota.NextRecoverAt.IsZero() || state.Quota.BackoffLevel != 0 {
+		return false
+	}
+	return true
+}
+
 func updateAggregatedAvailability(auth *Auth, now time.Time) {
-	if auth == nil || len(auth.ModelStates) == 0 {
+	if auth == nil {
+		return
+	}
+	if len(auth.ModelStates) == 0 {
+		clearAggregatedAvailability(auth)
 		return
 	}
 	allUnavailable := true
@@ -1982,10 +2191,12 @@ func updateAggregatedAvailability(auth *Auth, now time.Time) {
 	quotaExceeded := false
 	quotaRecover := time.Time{}
 	maxBackoffLevel := 0
+	hasState := false
 	for _, state := range auth.ModelStates {
 		if state == nil {
 			continue
 		}
+		hasState = true
 		stateUnavailable := false
 		if state.Status == StatusDisabled {
 			stateUnavailable = true
@@ -2015,6 +2226,10 @@ func updateAggregatedAvailability(auth *Auth, now time.Time) {
 			}
 		}
 	}
+	if !hasState {
+		clearAggregatedAvailability(auth)
+		return
+	}
 	auth.Unavailable = allUnavailable
 	if allUnavailable {
 		auth.NextRetryAfter = earliestRetry
@@ -2032,6 +2247,15 @@ func updateAggregatedAvailability(auth *Auth, now time.Time) {
 		auth.Quota.NextRecoverAt = time.Time{}
 		auth.Quota.BackoffLevel = 0
 	}
+}
+
+func clearAggregatedAvailability(auth *Auth) {
+	if auth == nil {
+		return
+	}
+	auth.Unavailable = false
+	auth.NextRetryAfter = time.Time{}
+	auth.Quota = QuotaState{}
 }
 
 func hasModelError(auth *Auth, now time.Time) bool {
@@ -2111,7 +2335,8 @@ func retryAfterFromError(err error) *time.Duration {
 	if retryAfter == nil {
 		return nil
 	}
-	return new(*retryAfter)
+	value := *retryAfter
+	return &value
 }
 
 func statusCodeFromResult(err *Error) int {
@@ -2201,11 +2426,18 @@ func isRequestInvalidError(err error) bool {
 	status := statusCodeFromError(err)
 	switch status {
 	case http.StatusBadRequest:
-		return strings.Contains(err.Error(), "invalid_request_error")
+		msg := err.Error()
+		return strings.Contains(msg, "invalid_request_error") ||
+			strings.Contains(msg, "INVALID_ARGUMENT") ||
+			strings.Contains(msg, "FAILED_PRECONDITION")
 	case http.StatusNotFound:
 		return isRequestScopedNotFoundMessage(err.Error())
 	case http.StatusUnprocessableEntity:
 		return true
+	case http.StatusInternalServerError:
+		msg := err.Error()
+		return strings.Contains(msg, "\"status\":\"UNKNOWN\"") ||
+			strings.Contains(msg, "\"status\": \"UNKNOWN\"")
 	default:
 		return false
 	}
@@ -2218,6 +2450,7 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 	if isRequestScopedNotFoundResultError(resultErr) {
 		return
 	}
+	disableCooling := quotaCooldownDisabledForAuth(auth)
 	auth.Unavailable = true
 	auth.Status = StatusError
 	auth.UpdatedAt = now
@@ -2231,32 +2464,46 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 	switch statusCode {
 	case 401:
 		auth.StatusMessage = "unauthorized"
-		auth.NextRetryAfter = now.Add(30 * time.Minute)
+		if disableCooling {
+			auth.NextRetryAfter = time.Time{}
+		} else {
+			auth.NextRetryAfter = now.Add(30 * time.Minute)
+		}
 	case 402, 403:
 		auth.StatusMessage = "payment_required"
-		auth.NextRetryAfter = now.Add(30 * time.Minute)
+		if disableCooling {
+			auth.NextRetryAfter = time.Time{}
+		} else {
+			auth.NextRetryAfter = now.Add(30 * time.Minute)
+		}
 	case 404:
 		auth.StatusMessage = "not_found"
-		auth.NextRetryAfter = now.Add(12 * time.Hour)
+		if disableCooling {
+			auth.NextRetryAfter = time.Time{}
+		} else {
+			auth.NextRetryAfter = now.Add(12 * time.Hour)
+		}
 	case 429:
 		auth.StatusMessage = "quota exhausted"
 		auth.Quota.Exceeded = true
 		auth.Quota.Reason = "quota"
 		var next time.Time
-		if retryAfter != nil {
-			next = now.Add(*retryAfter)
-		} else {
-			cooldown, nextLevel := nextQuotaCooldown(auth.Quota.BackoffLevel, quotaCooldownDisabledForAuth(auth))
-			if cooldown > 0 {
-				next = now.Add(cooldown)
+		if !disableCooling {
+			if retryAfter != nil {
+				next = now.Add(*retryAfter)
+			} else {
+				cooldown, nextLevel := nextQuotaCooldown(auth.Quota.BackoffLevel, disableCooling)
+				if cooldown > 0 {
+					next = now.Add(cooldown)
+				}
+				auth.Quota.BackoffLevel = nextLevel
 			}
-			auth.Quota.BackoffLevel = nextLevel
 		}
 		auth.Quota.NextRecoverAt = next
 		auth.NextRetryAfter = next
 	case 408, 500, 502, 503, 504:
 		auth.StatusMessage = "transient upstream error"
-		if quotaCooldownDisabledForAuth(auth) {
+		if disableCooling {
 			auth.NextRetryAfter = time.Time{}
 		} else {
 			auth.NextRetryAfter = now.Add(1 * time.Minute)
@@ -2663,6 +2910,175 @@ func (m *Manager) pickNextMixed(ctx context.Context, providers []string, model s
 	return authCopy, executor, providerKey, nil
 }
 
+func (m *Manager) findAllAntigravityCreditsCandidateAuths(routeModel string, opts cliproxyexecutor.Options) []creditsCandidateEntry {
+	if m == nil {
+		return nil
+	}
+	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	var known []creditsCandidateEntry
+	var unknown []creditsCandidateEntry
+	for _, auth := range m.auths {
+		if auth == nil || auth.Disabled || auth.Status == StatusDisabled {
+			continue
+		}
+		if pinnedAuthID != "" && auth.ID != pinnedAuthID {
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(auth.Provider), "antigravity") {
+			continue
+		}
+		if !strings.Contains(strings.ToLower(strings.TrimSpace(routeModel)), "claude") {
+			continue
+		}
+		providerKey := strings.TrimSpace(strings.ToLower(auth.Provider))
+		executor, ok := m.executors[providerKey]
+		if !ok {
+			continue
+		}
+
+		hint, okHint := GetAntigravityCreditsHint(auth.ID)
+		if okHint && hint.Known {
+			if !hint.Available {
+				continue
+			}
+			known = append(known, creditsCandidateEntry{
+				auth:     auth.Clone(),
+				executor: executor,
+				provider: providerKey,
+			})
+			continue
+		}
+		unknown = append(unknown, creditsCandidateEntry{
+			auth:     auth.Clone(),
+			executor: executor,
+			provider: providerKey,
+		})
+	}
+	sort.Slice(known, func(i, j int) bool {
+		return known[i].auth.ID < known[j].auth.ID
+	})
+	sort.Slice(unknown, func(i, j int) bool {
+		return unknown[i].auth.ID < unknown[j].auth.ID
+	})
+	return append(known, unknown...)
+}
+
+type creditsCandidateEntry struct {
+	auth     *Auth
+	executor ProviderExecutor
+	provider string
+}
+
+func shouldAttemptAntigravityCreditsFallback(m *Manager, lastErr error, providers []string) bool {
+	if m == nil || lastErr == nil {
+		return false
+	}
+	if len(providers) > 0 {
+		hasAntigravity := false
+		for _, p := range providers {
+			if strings.EqualFold(strings.TrimSpace(p), "antigravity") {
+				hasAntigravity = true
+				break
+			}
+		}
+		if !hasAntigravity {
+			return false
+		}
+	}
+	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+	if cfg == nil || !cfg.QuotaExceeded.AntigravityCredits {
+		return false
+	}
+	status := statusCodeFromError(lastErr)
+	switch status {
+	case http.StatusTooManyRequests, http.StatusServiceUnavailable:
+		return true
+	case 0:
+		var authErr *Error
+		if errors.As(lastErr, &authErr) && authErr != nil {
+			return authErr.Code == "auth_not_found" || authErr.Code == "auth_unavailable" || authErr.Code == "model_cooldown"
+		}
+		var cooldownErr *modelCooldownError
+		if errors.As(lastErr, &cooldownErr) {
+			return true
+		}
+		return false
+	default:
+		return false
+	}
+}
+
+func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, bool) {
+	routeModel := req.Model
+	candidates := m.findAllAntigravityCreditsCandidateAuths(routeModel, opts)
+	for _, c := range candidates {
+		if ctx.Err() != nil {
+			return cliproxyexecutor.Response{}, false
+		}
+		creditsCtx := WithAntigravityCredits(ctx)
+		if rt := m.roundTripperFor(c.auth); rt != nil {
+			creditsCtx = context.WithValue(creditsCtx, roundTripperContextKey{}, rt)
+			creditsCtx = context.WithValue(creditsCtx, "cliproxy.roundtripper", rt)
+		}
+		creditsOpts := ensureRequestedModelMetadata(opts, routeModel)
+		publishSelectedAuthMetadata(creditsOpts.Metadata, c.auth.ID)
+		models := m.executionModelCandidates(c.auth, routeModel)
+		if len(models) == 0 {
+			continue
+		}
+		for _, upstreamModel := range models {
+			resultModel := m.stateModelForExecution(c.auth, routeModel, upstreamModel, len(models) > 1)
+			execReq := req
+			execReq.Model = upstreamModel
+			resp, errExec := c.executor.Execute(creditsCtx, c.auth, execReq, creditsOpts)
+			result := Result{AuthID: c.auth.ID, Provider: c.provider, Model: resultModel, Success: errExec == nil}
+			if errExec != nil {
+				result.Error = &Error{Message: errExec.Error()}
+				if se, ok := errors.AsType[cliproxyexecutor.StatusError](errExec); ok && se != nil {
+					result.Error.HTTPStatus = se.StatusCode()
+				}
+				if ra := retryAfterFromError(errExec); ra != nil {
+					result.RetryAfter = ra
+				}
+				m.MarkResult(creditsCtx, result)
+				continue
+			}
+			m.MarkResult(creditsCtx, result)
+			return resp, true
+		}
+	}
+	return cliproxyexecutor.Response{}, false
+}
+
+func (m *Manager) tryAntigravityCreditsExecuteStream(ctx context.Context, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, bool) {
+	routeModel := req.Model
+	candidates := m.findAllAntigravityCreditsCandidateAuths(routeModel, opts)
+	for _, c := range candidates {
+		if ctx.Err() != nil {
+			return nil, false
+		}
+		creditsCtx := WithAntigravityCredits(ctx)
+		if rt := m.roundTripperFor(c.auth); rt != nil {
+			creditsCtx = context.WithValue(creditsCtx, roundTripperContextKey{}, rt)
+			creditsCtx = context.WithValue(creditsCtx, "cliproxy.roundtripper", rt)
+		}
+		creditsOpts := ensureRequestedModelMetadata(opts, routeModel)
+		publishSelectedAuthMetadata(creditsOpts.Metadata, c.auth.ID)
+		models := m.executionModelCandidates(c.auth, routeModel)
+		if len(models) == 0 {
+			continue
+		}
+		result, errStream := m.executeStreamWithModelPool(creditsCtx, c.executor, c.auth, c.provider, req, creditsOpts, routeModel, models, len(models) > 1)
+		if errStream != nil {
+			continue
+		}
+		return result, true
+	}
+	return nil, false
+}
+
 func (m *Manager) persist(ctx context.Context, auth *Auth) error {
 	if m.store == nil || auth == nil {
 		return nil
@@ -2690,80 +3106,60 @@ func (m *Manager) StartAutoRefresh(parent context.Context, interval time.Duratio
 	if interval <= 0 {
 		interval = refreshCheckInterval
 	}
-	if m.refreshCancel != nil {
-		m.refreshCancel()
-		m.refreshCancel = nil
+
+	m.mu.Lock()
+	cancelPrev := m.refreshCancel
+	m.refreshCancel = nil
+	m.refreshLoop = nil
+	m.mu.Unlock()
+	if cancelPrev != nil {
+		cancelPrev()
 	}
-	ctx, cancel := context.WithCancel(parent)
-	m.refreshCancel = cancel
-	go func() {
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-		m.checkRefreshes(ctx)
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				m.checkRefreshes(ctx)
-			}
-		}
-	}()
+
+	ctx, cancelCtx := context.WithCancel(parent)
+	workers := refreshMaxConcurrency
+	if cfg, ok := m.runtimeConfig.Load().(*internalconfig.Config); ok && cfg != nil && cfg.AuthAutoRefreshWorkers > 0 {
+		workers = cfg.AuthAutoRefreshWorkers
+	}
+	loop := newAuthAutoRefreshLoop(m, interval, workers)
+
+	m.mu.Lock()
+	m.refreshCancel = cancelCtx
+	m.refreshLoop = loop
+	m.mu.Unlock()
+
+	loop.rebuild(time.Now())
+	go loop.run(ctx)
 }
 
 // StopAutoRefresh cancels the background refresh loop, if running.
+// It also stops the selector if it implements StoppableSelector.
 func (m *Manager) StopAutoRefresh() {
-	if m.refreshCancel != nil {
-		m.refreshCancel()
-		m.refreshCancel = nil
+	m.mu.Lock()
+	cancel := m.refreshCancel
+	m.refreshCancel = nil
+	m.refreshLoop = nil
+	m.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	// Stop selector if it implements StoppableSelector (e.g., SessionAffinitySelector)
+	if stoppable, ok := m.selector.(StoppableSelector); ok {
+		stoppable.Stop()
 	}
 }
 
-func (m *Manager) checkRefreshes(ctx context.Context) {
-	// log.Debugf("checking refreshes")
-	now := time.Now()
-	snapshot := m.snapshotAuths()
-	for _, a := range snapshot {
-		typ, _ := a.AccountInfo()
-		if typ != "api_key" {
-			if !m.shouldRefresh(a, now) {
-				continue
-			}
-			log.Debugf("checking refresh for %s, %s, %s", a.Provider, a.ID, typ)
-
-			if exec := m.executorFor(a.Provider); exec == nil {
-				continue
-			}
-			if !m.markRefreshPending(a.ID, now) {
-				continue
-			}
-			go m.refreshAuthWithLimit(ctx, a.ID)
-		}
-	}
-}
-
-func (m *Manager) refreshAuthWithLimit(ctx context.Context, id string) {
-	if m.refreshSemaphore == nil {
-		m.refreshAuth(ctx, id)
+func (m *Manager) queueRefreshReschedule(authID string) {
+	if m == nil || authID == "" {
 		return
 	}
-	select {
-	case m.refreshSemaphore <- struct{}{}:
-		defer func() { <-m.refreshSemaphore }()
-	case <-ctx.Done():
-		return
-	}
-	m.refreshAuth(ctx, id)
-}
-
-func (m *Manager) snapshotAuths() []*Auth {
 	m.mu.RLock()
-	defer m.mu.RUnlock()
-	out := make([]*Auth, 0, len(m.auths))
-	for _, a := range m.auths {
-		out = append(out, a.Clone())
+	loop := m.refreshLoop
+	m.mu.RUnlock()
+	if loop == nil {
+		return
 	}
-	return out
+	loop.queueReschedule(authID)
 }
 
 func (m *Manager) shouldRefresh(a *Auth, now time.Time) bool {
@@ -2973,16 +3369,20 @@ func lookupMetadataTime(meta map[string]any, keys ...string) (time.Time, bool) {
 
 func (m *Manager) markRefreshPending(id string, now time.Time) bool {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	auth, ok := m.auths[id]
 	if !ok || auth == nil || auth.Disabled {
+		m.mu.Unlock()
 		return false
 	}
 	if !auth.NextRefreshAfter.IsZero() && now.Before(auth.NextRefreshAfter) {
+		m.mu.Unlock()
 		return false
 	}
 	auth.NextRefreshAfter = now.Add(refreshPendingBackoff)
 	m.auths[id] = auth
+	m.mu.Unlock()
+
+	m.queueRefreshReschedule(id)
 	return true
 }
 
@@ -2993,14 +3393,15 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 	m.mu.RLock()
 	auth := m.auths[id]
 	var exec ProviderExecutor
+	var cloned *Auth
 	if auth != nil {
 		exec = m.executors[auth.Provider]
+		cloned = auth.Clone()
 	}
 	m.mu.RUnlock()
 	if auth == nil || exec == nil {
 		return
 	}
-	cloned := auth.Clone()
 	updated, err := exec.Refresh(ctx, cloned)
 	if err != nil && errors.Is(err, context.Canceled) {
 		log.Debugf("refresh canceled for %s, %s", auth.Provider, auth.ID)
@@ -3009,16 +3410,21 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 	log.Debugf("refreshed %s, %s, %v", auth.Provider, auth.ID, err)
 	now := time.Now()
 	if err != nil {
+		shouldReschedule := false
 		m.mu.Lock()
 		if current := m.auths[id]; current != nil {
 			current.NextRefreshAfter = now.Add(refreshFailureBackoff)
 			current.LastError = &Error{Message: err.Error()}
 			m.auths[id] = current
+			shouldReschedule = true
 			if m.scheduler != nil {
 				m.scheduler.upsertAuth(current.Clone())
 			}
 		}
 		m.mu.Unlock()
+		if shouldReschedule {
+			m.queueRefreshReschedule(id)
+		}
 		return
 	}
 	if updated == nil {
@@ -3033,6 +3439,9 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 	updated.NextRefreshAfter = time.Time{}
 	updated.LastError = nil
 	updated.UpdatedAt = now
+	if m.shouldRefresh(updated, now) {
+		updated.NextRefreshAfter = now.Add(refreshIneffectiveBackoff)
+	}
 	_, _ = m.Update(ctx, updated)
 }
 
