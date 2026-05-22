@@ -9,6 +9,10 @@ type SDKConfig struct {
 	// ProxyURL is the URL of an optional proxy server to use for outbound requests.
 	ProxyURL string `yaml:"proxy-url" json:"proxy-url"`
 
+	// TLSInsecure disables upstream TLS certificate verification for proxy-aware runtime HTTP clients.
+	// This is intended only for debugging or trusted interception environments.
+	TLSInsecure bool `yaml:"tls-insecure" json:"tls-insecure"`
+
 	// DisableImageGeneration controls whether the built-in image_generation tool is injected/allowed.
 	//
 	// Supported values:

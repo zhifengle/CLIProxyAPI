@@ -69,6 +69,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if oldCfg.ProxyURL != newCfg.ProxyURL {
 		changes = append(changes, fmt.Sprintf("proxy-url: %s -> %s", formatProxyURL(oldCfg.ProxyURL), formatProxyURL(newCfg.ProxyURL)))
 	}
+	if oldCfg.TLSInsecure != newCfg.TLSInsecure {
+		changes = append(changes, fmt.Sprintf("tls-insecure: %t -> %t", oldCfg.TLSInsecure, newCfg.TLSInsecure))
+	}
 	if oldCfg.WebsocketAuth != newCfg.WebsocketAuth {
 		changes = append(changes, fmt.Sprintf("ws-auth: %t -> %t", oldCfg.WebsocketAuth, newCfg.WebsocketAuth))
 	}
